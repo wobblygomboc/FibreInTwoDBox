@@ -6,10 +6,10 @@ fibre_in_two_d_box
 #---------------------------------------------------------------------------
 
 # Local sources that Joe's Poisson code depends on:
-fibre_in_two_d_boxt_SOURCES = fibre_in_two_d_boxt.cc unstructured_moffatt_mesh_3_inner_boundaries.h
+fibre_in_two_d_box_SOURCES = fibre_in_two_d_box.cc unstructured_moffatt_mesh_3_inner_boundaries.h
 
 # Required libraries: 
-fibre_in_two_d_boxt_LDADD = -L@libdir@  -lnavier_stokes -lgeneric $(EXTERNAL_LIBS) $(FLIBS)
+fibre_in_two_d_box_LDADD = -L@libdir@  -lnavier_stokes -lgeneric $(EXTERNAL_LIBS) $(FLIBS)
 #---------------------------------------------------------------------------
 
 # Include path for library headers: All library headers live in 
