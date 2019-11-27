@@ -402,7 +402,7 @@ FibreInTwoDBoxProblem<ELEMENT> :: FibreInTwoDBoxProblem()
   Bulk_mesh_pt->min_permitted_error()=0.0;
 
   // duplicate nodes above the plate to allow for a pressure jump across the plate
-  // duplicate_plate_nodes_and_add_boundary();
+  duplicate_plate_nodes_and_add_boundary();
 
   // Add sub-meshes
   add_sub_mesh(Bulk_mesh_pt);
@@ -412,7 +412,7 @@ FibreInTwoDBoxProblem<ELEMENT> :: FibreInTwoDBoxProblem()
   Internal_boundary_surface_mesh_pt = new Mesh;
   
   // attach face elements to bulk elements in the upper region on the internal boundaries
-  // attach_internal_boundary_face_elements();
+  attach_internal_boundary_face_elements();
   
   add_sub_mesh(Internal_boundary_surface_mesh_pt);
   
