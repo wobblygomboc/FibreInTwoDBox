@@ -27,11 +27,15 @@
 //LIC// The authors may be contacted at oomph-lib@maths.man.ac.uk.
 //LIC//
 //LIC//====================================================================
-//Driver for Poisson in backward step domain -- meshed with triangle
+//Driver for 1D fibre moving in a 2D box -- meshed with triangle
+
+// forces the use of a finite-differenced jacobian, for debug
+#define USE_FD_JACOBIAN
 
 //Generic includes
 #include "generic.h"
-// #include "poisson.h" // QUEHACERES remove once we've full switched over to TaylorHood elems
+
+// Navier-Stokes equations and Taylor-Hood elements
 #include "navier_stokes.h"
 
 // The mesh
@@ -39,6 +43,16 @@
 
 // wrapper for locate zeta to allow us to visualise along a given line
 #include "generic/line_visualiser.h"
+
+// classes which contain the machinery for the subtraction of singularities
+#include "navier_stokes_sing_face_element.h"
+
+// generic class for a plate as a geometric object, and specific cases,
+// a spherical plate and a flat plate
+# include "plate_as_geometric_object.h"
+
+// the solution for the flow around a semi-infinite plate at x>0 
+#include "moffat_solution.h"
 
 // ********************************************************************************
 
@@ -89,6 +103,16 @@ namespace Additional_Maths_Functions
 //==================================================
 namespace Global_Physical_Variables
 {
+  // Results output directory
+  string dir = "RESLT";
+  
+  // hacky
+  Plate* Plate_pt = 0;
+
+  // fake singular amplitude for debugging
+  // (when bypassing proper calculation of the amplitude)
+  double singular_amplitude_for_debug = 0;
+  
   // Dimensionless domain values
   // ---------------------------
   double L_edge_x      = -0.5;
@@ -105,15 +129,21 @@ namespace Global_Physical_Variables
   // high resolution element area for the regions near the plate edges
   double hi_res_element_area = 1e-2; // 1e-6;
 
+  // flag to switch the high-res regions on/off
+  bool include_hi_res_regions = true;
+  
   // double high_res_region_radius = 0.1;  
 
   // angular coordinate along plate where the circles bounding the high-resolution regions
   // intersect. 0.17rad ~10deg
-  double high_res_region_zeta = 0.17;
+  double high_res_region_zeta = 0.1;
   
   /// Reynolds number
   double Re = 0.0; 
 
+  // rigid-body velocity of the boundaries (u_x, u_y)
+  Vector<double> boundary_velocity(2, 0.0);
+  
   // any rotational velocity the plate/boundary has, positive is anticlockwise (i.e. right-hand rule)
   double angular_velocity_plate    = 0.0;
   double angular_velocity_boundary = 0.0;
@@ -127,8 +157,12 @@ namespace Global_Physical_Variables
   // boundaries
   enum
   {
+    First_outer_boundary            = 0,
     Outer_boundary_upper            = 0,
-    Outer_boundary_lower            = 1,    
+    Outer_boundary_lower            = 1,
+    Last_outer_boundary,                  // for looping
+
+    First_inner_boundary            = 2,
     Inner_region_boundary_left      = 2,
     Inner_plate_boundary            = 3,
     Inner_region_boundary_right     = 4,
@@ -138,9 +172,13 @@ namespace Global_Physical_Variables
     Inner_hi_res_region_right_upper = 8,
     Inner_hi_res_region_right_connecting = 9,
     Inner_hi_res_region_right_lower = 10,
-    Inner_plate_boundary_upper      = 11  // this will be assigned once Triangle has assembled the mesh
+    Last_inner_boundary
   };
 
+  // this will be assigned once Triangle has assembled the mesh
+  // and will change if the high-res regions aren't being included
+  unsigned Inner_plate_boundary_upper = 11;
+  
   // regions
   enum
   {
@@ -150,24 +188,30 @@ namespace Global_Physical_Variables
     Region_hi_res_right_upper = 4,
     Region_hi_res_right_lower = 5
   };
-  
+ 
   // Bit of a hack but it facilitates reuse...
   #include "unstructured_moffatt_mesh_3_inner_boundaries.h"
+
+  Vector<double> u_BC(unsigned boundary_id)
+  {
+    Vector<double> u_bc(2,0.0);
+    
+    // in this instance, we're just doing no-slip & no-penetration everywhere
+    
+    return u_bc;
+  }
 } // end_of_namespace
 
 //==start_of_namespace==============================
 /// Namespace for analytic functions
 //==================================================
 namespace Analytic_Functions
-{
-  // QUEHACERES
-  double A = 1, B = 1;
-  
+{  
   /// \short Function to convert 2D Polar derivatives (du/dr, du/dtheta, dv/dr, dv/dtheta)
   // to Cartesian derivatives (dux/dx, dux/dy, duy/dx, duy/dy)
-  DenseMatrix<double> polar_to_cartesian_derivatives_2d(DenseMatrix<double> grad_u_polar,
-							Vector<double> u_polar,
-							double r, double theta)
+  DenseMatrix<double> polar_to_cartesian_derivatives_2d(const DenseMatrix<double> grad_u_polar,
+							const Vector<double> u_polar,
+							const double r, double theta)
   {
     // shorthand for polar components
     double u = u_polar[0];
@@ -203,6 +247,201 @@ namespace Analytic_Functions
 
     return du_dx;
   }
+
+  /// \short Newtonian stress tensor
+  DenseMatrix<double> newtonian_stress(const DenseMatrix<double>& strain_rate,
+				       const double& p)
+  {
+    // \tau_{ij}
+    DenseMatrix<double> stress(2,2);
+    
+    for(unsigned i=0; i<2; i++)
+    {
+      for(unsigned j=0; j<2; j++)
+      {
+	// Newtonian constitutive relation
+	stress(i,j) = -p*Additional_Maths_Functions::delta(i,j) + 2.0*strain_rate(i,j);
+      }
+    }
+
+    return stress;
+  }
+  
+  /// \short "Singular" function and gradient
+  void singular_fct_and_gradient(const Vector<double>& x,
+				 Vector<double>& u, DenseMatrix<double>& du_dx,
+				 int boundary_id=-1)
+  {
+    // big number to numerically represent infinity; value of 1/r at 1/2 of
+    // the element lengthscale
+    const double infinity = 2.0 / sqrt(2.0 * Global_Physical_Variables::element_area);
+    
+    // this coresponds to pure normal flow
+    double A = 0;
+    double B = -1;
+
+    // location of plate starting edge   
+    Vector<double> zeta_start(1);
+    zeta_start[0] = Global_Physical_Variables::Plate_pt->zeta_start();
+
+    Vector<double> left_coords(2);
+    Global_Physical_Variables::Plate_pt->position(zeta_start, left_coords);
+
+    // solution in polar coordinates
+    Vector<double>      u_polar(3, 0.0);
+    DenseMatrix<double> grad_u_polar(2,2);
+    
+    // get the coordinates of this location relative to a coordinate system
+    // centred on the left edge of the plate
+    Vector<double> relative_coords(2);
+    relative_coords[0] = x[0] - left_coords[0];
+    relative_coords[1] = x[1] - left_coords[1];
+
+    // QUEHACERES also account for rotation here
+
+    // radius and angle as measured from the edge of the plate
+    double r_relative = sqrt(pow(relative_coords[0],2) + pow(relative_coords[1],2));
+
+    // QUEHACERES this will only work for flat plates!!
+    // catch slight overshoot of lower plate nodes
+    double tol_y = 1.0e-12;
+    if ((relative_coords[1] >= 0.0) && (relative_coords[1] < tol_y)
+	&& boundary_id == int(Global_Physical_Variables::Inner_plate_boundary))
+    {
+      // set to small negative number so the angle is ~2pi
+      relative_coords[1] = -tol_y;
+    }
+
+    if ((relative_coords[1] < 0.0) && (relative_coords[1] > -tol_y)
+	&& boundary_id == int(Global_Physical_Variables::Inner_plate_boundary_upper))
+    {
+      // set to 0 so that the angle is 0
+      relative_coords[1] = 0.0;
+    }
+    
+    double theta_relative =
+      Additional_Maths_Functions::atan2pi(relative_coords[1], relative_coords[0]);
+
+        
+    // get the moffat solution for this relative position in polar coordinates
+    moffat_solution(r_relative, theta_relative, A, B, u_polar, grad_u_polar);
+
+    // check if we're at the origin
+    bool at_origin = r_relative == 0;
+    
+    // make sure we've got the right amount of space
+    u.resize(3);
+    du_dx.resize(2);
+
+    // convert velocity components to Cartesians
+    u[0] = u_polar[0] * cos(theta_relative) - u_polar[1] * sin(theta_relative);
+    u[1] = u_polar[0] * sin(theta_relative) + u_polar[1] * cos(theta_relative);
+
+    // pressure is a scalar so unchanged by coordinate transform
+    u[2] = u_polar[2];
+    
+    // convert velocity gradient from polar to cartesian
+    du_dx = polar_to_cartesian_derivatives_2d(grad_u_polar, u_polar, r_relative, theta_relative);
+
+    // catch the point exactly at the origin
+    if(at_origin)
+    {
+      // from BCs
+      u[0] = 0.0;
+      u[1] = 0.0; 
+      u[2] = -infinity;
+
+      du_dx(0,0) =  infinity;
+      du_dx(0,1) = -infinity;
+      du_dx(1,0) =  infinity;
+      du_dx(1,1) = -infinity;
+    }
+
+    // QUEHACERES account for plate velocity
+    // u[0] += Global_Physical_Variables::plate_velocity[0];
+    // u[1] += Global_Physical_Variables::plate_velocity[1];
+    
+    // // QUEHACERES debug
+    // u[0] = x[0]; // r_relative;
+    // u[1] = 0.0;
+    // u[2] = 0.0;
+
+    // du_dx(0,0) = 0.0;
+    // du_dx(0,1) = 0.0;
+    // du_dx(1,0) = 0.0;
+    // du_dx(1,1) = 0.0;
+    
+  }  
+
+  /// \short "Singular" function for right hand edge
+  Vector<double> singular_fct_and_gradient_right(const Vector<double>& x,
+						 Vector<double>& u, DenseMatrix<double>& du_dx,
+						 int boundary_id=-1)
+  {
+    Vector<double>x_flipped(2);
+    
+    // flip x coordinate so appears as though the plate is at x>0
+    // sort this out at some point, remove left shifting from singular_fct_and_gradient()
+    x_flipped[0] = - (x[0]); //  - Global_Physical_Variables::plate_radius);
+
+    // y coordinate unchanged
+    x_flipped[1] = x[1];
+      
+    singular_fct_and_gradient(x_flipped, u, du_dx, boundary_id);
+
+    // account for the flip in the y-axis;
+    // u_x, du_x/dy and du_y/dx need to be flipped, but not du_x/dx as the signs cancel.
+    u[0] = -u[0];
+    
+    du_dx(0,1) = -du_dx(0,1);
+    du_dx(1,0) = -du_dx(1,0);
+    
+    return u;
+  }
+  
+  /// \short "Singular" function
+  Vector<double> singular_fct(const Vector<double>& x, int boundary_id=-1)
+  {
+    Vector<double> u(3);
+    DenseMatrix<double> du_dx(2,2);
+    
+    singular_fct_and_gradient(x, u, du_dx, boundary_id);
+    
+    return u;
+  }
+
+  /// \short "Singular" function
+  Vector<double> singular_fct_right(const Vector<double>& x, int boundary_id=-1)
+  {
+    Vector<double> u(3);
+    DenseMatrix<double> du_dx(2,2);
+    
+    singular_fct_and_gradient_right(x, u, du_dx, boundary_id);
+    
+    return u;
+  }
+  
+  /// \short Gradient of "Singular" function
+  DenseMatrix<double> gradient_of_singular_fct(const Vector<double>& x, int boundary_id=-1)
+  {
+    Vector<double> u(3, 0.0);
+    DenseMatrix<double> du_dx(2,2);    
+    
+    singular_fct_and_gradient(x, u, du_dx, boundary_id);
+
+    return du_dx;
+  }
+
+  /// \short Gradient of "Singular" function
+  DenseMatrix<double> gradient_of_singular_fct_right(const Vector<double>& x, int boundary_id=-1)
+  {
+    Vector<double> u(3, 0.0);
+    DenseMatrix<double> du_dx(2,2);    
+    
+    singular_fct_and_gradient_right(x, u, du_dx, boundary_id);
+
+    return du_dx;
+  }
   
   /// \short Newtonian stress tensor
   DenseMatrix<double> get_stress(const DenseMatrix<double>& strain_rate,
@@ -225,57 +464,57 @@ namespace Analytic_Functions
   
   double get_exact_pressure(const Vector<double>& x)
   {
-    // radius
-    double r = sqrt(x[0]*x[0] + x[1]*x[1]);
+    // // radius
+    // double r = sqrt(x[0]*x[0] + x[1]*x[1]);
 
-    // polar angle
-    double theta = Additional_Maths_Functions::atan2pi(x[1], x[0]);
+    // // polar angle
+    // double theta = Additional_Maths_Functions::atan2pi(x[1], x[0]);
 
-    // analytic result for p
-    double p = -(2.0/sqrt(r)) * ( A * sin(theta/2.0) + 3.0*B*cos(theta/2.0) );
+    // // analytic result for p
+    // double p = -(2.0/sqrt(r)) * ( A * sin(theta/2.0) + 3.0*B*cos(theta/2.0) );
 
-    // catch infinities and set to a large number
-    if (r == 0)
-    {
-      // figure out if we're going towards +/- infinity
-      double sign = Additional_Maths_Functions::sgn( -(A * sin(theta/2.0) + 3.0*B*cos(theta/2.0)) );
+    // // catch infinities and set to a large number
+    // if (r == 0)
+    // {
+    //   // figure out if we're going towards +/- infinity
+    //   double sign = Additional_Maths_Functions::sgn( -(A * sin(theta/2.0) + 3.0*B*cos(theta/2.0)) );
 
-      // set to a large finite number
-      p = sign * 1000;
-    }
+    //   // set to a large finite number
+    //   p = sign * 1000;
+    // }
     
-    return p;
+    // return p;
   }
 
   // computes exact solution at vector position x and returns vector (u,v,p)
   void get_exact_soln_as_vector(const Vector<double>& x, Vector<double>& u)
   {
-    // Radius
-    double r = sqrt(x[0]*x[0] + x[1]*x[1]);
+    // // Radius
+    // double r = sqrt(x[0]*x[0] + x[1]*x[1]);
 
-    double y = x[1];
+    // double y = x[1];
     
-    // Polar angle
-    double theta = Additional_Maths_Functions::atan2pi(y, x[0]);
+    // // Polar angle
+    // double theta = Additional_Maths_Functions::atan2pi(y, x[0]);
     
-    // velocity components for general Panton solution (from Mathematica)
-    double u_r = sqrt(r) * (
-      -(B*((-3*cos(theta/2.))/2. + (3*cos((3*theta)/2.))/2.))
-      + A*(sin(theta/2.)/2. - (3*sin((3*theta)/2.))/2.) );
+    // // velocity components for general Panton solution (from Mathematica)
+    // double u_r = sqrt(r) * (
+    //   -(B*((-3*cos(theta/2.))/2. + (3*cos((3*theta)/2.))/2.))
+    //   + A*(sin(theta/2.)/2. - (3*sin((3*theta)/2.))/2.) );
     
-    double u_theta = (-3*sqrt(r)*(A*(-cos(theta/2.) +
-				     cos((3*theta)/2.)) - B*(-3*sin(theta/2.)
-							     + sin((3*theta)/2.))))/2.;
+    // double u_theta = (-3*sqrt(r)*(A*(-cos(theta/2.) +
+    // 				     cos((3*theta)/2.)) - B*(-3*sin(theta/2.)
+    // 							     + sin((3*theta)/2.))))/2.;
 
-    // resize in case an un-initialised vector gets passed in
-    u.resize(3);
+    // // resize in case an un-initialised vector gets passed in
+    // u.resize(3);
     
-    // convert to Cartesians
-    u[0] = u_r * cos(theta) - u_theta * sin(theta);
-    u[1] = u_r * sin(theta) + u_theta * cos(theta);
+    // // convert to Cartesians
+    // u[0] = u_r * cos(theta) - u_theta * sin(theta);
+    // u[1] = u_r * sin(theta) + u_theta * cos(theta);
 
-    // get the pressure
-    u[2] = get_exact_pressure(x);
+    // // get the pressure
+    // u[2] = get_exact_pressure(x);
   }
 }
 
@@ -310,8 +549,31 @@ public:
   void actions_after_newton_solve(){}
  
   /// \short Update the problem specs before solve (empty)
-  void actions_before_newton_solve() {}
- 
+  void actions_before_newton_step()
+    {
+      // QUEHACERES
+      
+      // residual vector and Jacobian matrix
+      DoubleVector r;
+      CRDoubleMatrix jac;
+
+      // get 'em
+      get_jacobian(r,jac);
+  
+      ofstream some_file;      
+      char filename[100];
+      
+      sprintf(filename,"%s/jacobian_sparse%i_newton_step_%i.dat", Doc_info.directory().c_str(),
+	      Doc_info.number(), Newton_step_counter);      
+      some_file.open(filename);
+      
+      jac.sparse_indexed_output(some_file);
+
+      some_file.close();
+
+      Newton_step_counter++;
+    }
+  
   // Perform actions after mesh adaptation
   void actions_after_adapt()
     {      
@@ -342,10 +604,171 @@ public:
     }
  
   /// Doc the solution
-  void doc_solution(DocInfo& doc_info);
+  void doc_solution();
 
+  Plate* plate_pt()
+    {
+      return Plate_pt;
+    }
+
+  // function to directly impose the singular amplitude and bypass the 
+  // proper calculation
+  void impose_fake_singular_amplitude();
+
+  // for debug / validation of singular solution
+  void set_values_to_singular_solution();
+  
 private:
 
+  unsigned Newton_step_counter;
+  
+  /// hierher Delete face elements and flush meshes
+  void delete_face_elements()
+  {
+    if (CommandLineArgs::command_line_flag_has_been_set
+	("--dont_subtract_singularity"))
+    {
+      return;
+    }
+
+    // Loop over the bc elements
+    unsigned n_element = Face_mesh_for_bc_pt->nelement();
+    for(unsigned e=0; e<n_element; e++)
+    {
+      // Kill
+      delete Face_mesh_for_bc_pt->element_pt(e);
+    }
+   
+    // Wipe the mesh
+    Face_mesh_for_bc_pt->flush_element_and_node_storage();
+
+    for(unsigned ising=0; ising<Nsingular_fct; ising++)
+    {
+      // Loop over the integral face elements
+      n_element = Face_mesh_for_singularity_integral_pt[ising]->nelement();
+      for(unsigned e=0; e<n_element; e++)
+      {
+	delete Face_mesh_for_singularity_integral_pt[ising]->element_pt(e);
+      }
+      Face_mesh_for_singularity_integral_pt[ising]->flush_element_and_node_storage();
+    }
+  }
+    
+  /// Create face elements
+  void create_face_elements()
+  {
+    // add Lagrange multipliers to enforce Dirichlet boundary conditions
+    if (CommandLineArgs::command_line_flag_has_been_set
+	("--enforce_dirichlet_bcs_by_lagrange_multipliers"))
+    {            
+      // loop over all the outer boundaries
+      for(unsigned i_bound=Global_Physical_Variables::First_outer_boundary;
+	  i_bound < Global_Physical_Variables::Last_outer_boundary; i_bound++)
+      {
+	// get the number of elements on this boundary
+	unsigned n_element = Bulk_mesh_pt->nboundary_element(i_bound);
+          
+	// Loop over the bulk elements adjacent to boundary b
+	for(unsigned e=0; e<n_element; e++)
+	{
+	  // Get pointer to the bulk element that is adjacent to boundary b
+	  ELEMENT* bulk_elem_pt = dynamic_cast<ELEMENT*>(
+	    Bulk_mesh_pt->boundary_element_pt(i_bound, e));
+	      
+	  //Find the index of the face of element e along boundary b 
+	  int face_index = Bulk_mesh_pt->face_index_at_boundary(i_bound, e);
+	  	  
+	  // Build the corresponding bc element
+	  // N.B. we're calling this without the optional ID, since we have a continuous
+	  // Lagrange multiplier field all the way around the outer boundary due to the
+	  // continuous no-slip boundary conditions
+	  NavierStokesWithSingularityBCFaceElement<ELEMENT>* bc_element_pt =
+	    new NavierStokesWithSingularityBCFaceElement<ELEMENT>
+	    (bulk_elem_pt, face_index);
+            
+	  // Tell the element about the singular fct
+	  if (!CommandLineArgs::command_line_flag_has_been_set
+	      ("--dont_subtract_singularity"))
+	  {
+	    Vector<ScalableSingularityForNavierStokesElement<ELEMENT>*> sing_el_pt(Nsingular_fct);
+
+	    for(unsigned ising=0; ising<Nsingular_fct; ising++)
+	    {
+	      sing_el_pt[ising] = dynamic_cast<ScalableSingularityForNavierStokesElement<ELEMENT>*>(
+		Singular_fct_element_mesh_pt->element_pt(ising));
+	    }
+	    
+	    bc_element_pt->set_navier_stokes_sing_el_pt(sing_el_pt);
+	  }
+	  
+	  //Add the bc element to the surface mesh
+	  Face_mesh_for_bc_pt->add_element_pt(bc_element_pt);
+	}
+      } // end loop over boundaries
+    }
+
+    if (CommandLineArgs::command_line_flag_has_been_set("--dont_subtract_singularity"))
+    {
+      return;
+    }
+
+    // Create the face elements needed to compute the amplitude of
+    // the singular function,
+   
+    // All outer boundaries
+    for(unsigned i_bound=Global_Physical_Variables::First_outer_boundary;
+	  i_bound < Global_Physical_Variables::Last_outer_boundary; i_bound++)
+    {
+      unsigned n_element = Bulk_mesh_pt->nboundary_element(i_bound);
+      for(unsigned e=0; e<n_element; e++)
+      {
+	//Create Pointer to bulk element adjacent to the boundary
+	ELEMENT* bulk_elem_pt = dynamic_cast<ELEMENT*>
+	  (Bulk_mesh_pt->boundary_element_pt(i_bound, e));
+       
+	//Get Face index of boundary in the bulk element
+	int face_index = Bulk_mesh_pt->face_index_at_boundary(i_bound, e);
+
+	for(unsigned ising=0; ising < Nsingular_fct; ising++)
+	{
+	  //Create corresponding face element
+	  NavierStokesWithSingularityBoundaryIntegralFaceElement<ELEMENT>* 
+	    boundary_integral_face_element_pt =
+	    new NavierStokesWithSingularityBoundaryIntegralFaceElement<ELEMENT>(
+	      bulk_elem_pt, face_index, i_bound);
+
+	  // We pass the pointer of singular function element to the face element
+	  boundary_integral_face_element_pt->navier_stokes_sing_el_pt() =
+	    dynamic_cast<ScalableSingularityForNavierStokesElement<ELEMENT>*>(
+	      Singular_fct_element_mesh_pt->element_pt(ising));
+
+	  //Attach it to the mesh
+	  Face_mesh_for_singularity_integral_pt[ising]->add_element_pt(boundary_integral_face_element_pt);
+	}
+      }
+    }
+
+    for(unsigned ising=0; ising < Nsingular_fct; ising++)
+    {
+      // Update the pointer to the face elements (currently needed so
+      // this GeneralisedElement can assemble the contributions to the
+      // r_C residual from the face elements!
+      dynamic_cast<ScalableSingularityForNavierStokesElement<ELEMENT>*>(
+	Singular_fct_element_mesh_pt->element_pt(ising))->
+	set_mesh_of_face_elements(Face_mesh_for_singularity_integral_pt[ising]);
+    }
+    
+  } // end of create_elements()
+
+  // object containing relevant info for documenting the solution
+  DocInfo Doc_info;
+  
+  // dimensionality of the problem
+  unsigned Dim;
+
+  // number of singular functions we're subtracting
+  unsigned Nsingular_fct;
+  
   /// Do what it says
   void complete_problem_setup();
  
@@ -370,8 +793,22 @@ private:
   /// the internal region boundaries
   Mesh* Internal_boundary_surface_mesh_pt;
 
+  /// Face element mesh for BC (Lagrange multiplier!) 
+  Mesh* Face_mesh_for_bc_pt;
+  
+  /// \short Meshes of face elements used to compute the amplitudes of the singular
+  /// functions (one mesh per singular function)
+  Vector<Mesh*> Face_mesh_for_singularity_integral_pt;
+ 
+  /// Mesh for (single) element containing singular fct
+  Mesh* Singular_fct_element_mesh_pt;
+  
   /// Geom object made of mesh
-  MeshAsGeomObject* Mesh_as_geom_object_pt;  
+  MeshAsGeomObject* Mesh_as_geom_object_pt;
+
+  // pointer to the plate Geometric Object
+  Plate* Plate_pt;
+  
 }; // end_of_problem_class
 
 
@@ -379,20 +816,65 @@ private:
 /// Constructor for FibreInTwoDBoxProblem problem
 //========================================================================
 template<class ELEMENT>
-FibreInTwoDBoxProblem<ELEMENT> :: FibreInTwoDBoxProblem()
+FibreInTwoDBoxProblem<ELEMENT> :: FibreInTwoDBoxProblem() : Newton_step_counter(0)
 {
+  // set the dimensionality
+  Dim = 2;
+
+  // number of singular functions that we're subtracting
+  Nsingular_fct = 2;
+  
+  // Set up doc info  
+  // ---------------
+
+  // don't run if the output folder doesn't exist
+  Doc_info.enable_error_if_directory_does_not_exist();
+  
+  // Set output directory
+  Doc_info.set_directory(Global_Physical_Variables::dir.c_str());
+ 
+  // Step number
+  Doc_info.number() = 0;
+
+  
+  Vector<double> start_coords(2, 0.0);
+  Vector<double> end_coords(2, 0.0);
+  
+  start_coords[0] = - Global_Physical_Variables::plate_radius;
+  end_coords[0]   = + Global_Physical_Variables::plate_radius;
+  
+  Plate_pt = new FlatPlate(start_coords, end_coords,
+  				  Global_Physical_Variables::high_res_region_zeta);
+
+  // QUEHACERES uncomment for circular plate ------------------------------
+  // // shorthand
+  // double r_c = Global_Physical_Variables::plate_radius_of_curvature;
+  
+  // // centre of the circle; central along x-axis of plate, and with
+  // // a y coordinate such that the two plate ends touch the edge of the circle
+  // double x_c = 0.0;
+  // double y_c = sqrt( pow(r_c,2) - pow(Global_Physical_Variables::plate_radius, 2) );
+
+  // // intrinsic coordinates of the start and end of the plate
+  // double s_plate_start = atan2(-y_c, -Global_Physical_Variables::plate_radius);
+  // double s_plate_end   = atan2(-y_c, +Global_Physical_Variables::plate_radius);
+  
+  // Make GeomObject representing a circular plate
+  // Plate* plate_pt =
+  //   new CircularPlate(x_c, y_c, r_c, s_plate_start, s_plate_end,
+  // 		       Global_Physical_Variables::high_res_region_zeta);
+  // --------------------------------------------------------------------
+
+  
   // Build the mesh
-  Bulk_mesh_pt = Global_Physical_Variables::build_the_mesh<ELEMENT> (Global_Physical_Variables::element_area);
+  Bulk_mesh_pt = Global_Physical_Variables::build_the_mesh<ELEMENT>
+    (Global_Physical_Variables::element_area, Plate_pt);
 
   // Let's have a look at the boundary enumeration
   Bulk_mesh_pt->output_boundaries("boundaries.dat");
 
   // Set error estimator for bulk mesh
   Z2ErrorEstimator* error_estimator_pt = new Z2ErrorEstimator;
-
-  // -----------------------------
-  // QUEHACERES stick back in when we're adding a refineable mesh
-  // -----------------------------  
   Bulk_mesh_pt->spatial_error_estimator_pt() = error_estimator_pt;
 
   // Set element size limits
@@ -415,6 +897,57 @@ FibreInTwoDBoxProblem<ELEMENT> :: FibreInTwoDBoxProblem()
   attach_internal_boundary_face_elements();
   
   add_sub_mesh(Internal_boundary_surface_mesh_pt);
+
+  // check we're not doing pure FE
+  if (!CommandLineArgs::command_line_flag_has_been_set("--dont_subtract_singularity"))
+  {
+
+    // ================================================================
+    // QUEHACERES need to add additional sinuglarities here...
+    // for the time being we'll do just one edge for the case 
+    
+    // Create element that stores the singular fct and its amplitude
+    //---------------------------------------------------------------
+    ScalableSingularityForNavierStokesElement<ELEMENT>* el_pt =
+      new ScalableSingularityForNavierStokesElement<ELEMENT>;
+
+    ScalableSingularityForNavierStokesElement<ELEMENT>* right_el_pt =
+      new ScalableSingularityForNavierStokesElement<ELEMENT>;
+    
+    // Pass fct pointers:
+    el_pt->unscaled_singular_fct_pt() = &Analytic_Functions::singular_fct;
+    el_pt->gradient_of_unscaled_singular_fct_pt() =
+      &Analytic_Functions::gradient_of_singular_fct;
+
+    right_el_pt->unscaled_singular_fct_pt() = &Analytic_Functions::singular_fct_right;
+    right_el_pt->gradient_of_unscaled_singular_fct_pt() =
+      &Analytic_Functions::gradient_of_singular_fct_right;
+    
+    // Add to mesh
+    Singular_fct_element_mesh_pt = new Mesh;
+    Singular_fct_element_mesh_pt->add_element_pt(el_pt);
+
+    // QUEHACERES don't add the right one yet
+    Singular_fct_element_mesh_pt->add_element_pt(right_el_pt);
+    
+    add_sub_mesh(Singular_fct_element_mesh_pt);
+
+    // Create face elements that compute contribution to amplitude residual
+    //---------------------------------------------------------------------
+    for(unsigned ising=0; ising < Nsingular_fct; ising++)
+    {
+      Face_mesh_for_singularity_integral_pt.push_back(new Mesh);
+    }
+  }
+
+  // Create face elements for imposition of BC
+  Face_mesh_for_bc_pt = new Mesh;
+
+  // Build the face elements
+  create_face_elements();
+
+  // Add 'em to mesh
+  add_sub_mesh(Face_mesh_for_bc_pt);
   
   // Build global mesh
   build_global_mesh();
@@ -932,7 +1465,56 @@ void FibreInTwoDBoxProblem<ELEMENT> :: duplicate_plate_nodes_and_add_boundary()
 //========================================================================
 template<class ELEMENT>
 void FibreInTwoDBoxProblem<ELEMENT>::complete_problem_setup()
-{ 
+{    
+  // Loop over the elements to set up element-specific
+  // things that cannot be handled by constructor
+  unsigned n_el=Bulk_mesh_pt->nelement();
+  for (unsigned e=0; e<n_el; e++)
+  {
+    ELEMENT* bulk_el_pt = dynamic_cast<ELEMENT*>(
+      Bulk_mesh_pt->element_pt(e));
+
+    // Tell bulk element which function computes the stress
+    bulk_el_pt->stress_fct_pt() = &Analytic_Functions::newtonian_stress;
+
+    if (!CommandLineArgs::command_line_flag_has_been_set("--dont_subtract_singularity"))
+    {
+      // get the number of singular functions to subtract
+      unsigned nsingular_fct = Singular_fct_element_mesh_pt->nelement();
+      for(unsigned ising=0; ising<Nsingular_fct; ising++)
+      {
+	// Tell the bulk element about each singular fct
+	bulk_el_pt->add_singular_fct_pt(
+	  dynamic_cast<TemplateFreeScalableSingularityForNavierStokesElement*>(
+	    Singular_fct_element_mesh_pt->element_pt(ising)) );
+      }
+    }
+  }
+  
+  if (!CommandLineArgs::command_line_flag_has_been_set("--dont_subtract_singularity"))
+  { 
+    //BC elements
+    unsigned n_element = Face_mesh_for_bc_pt->nelement();
+    for(unsigned e=0; e<n_element; e++)
+    {
+      // Upcast from GeneralisedElement to the present element
+      NavierStokesWithSingularityBCFaceElement<ELEMENT>* el_pt =
+	dynamic_cast<NavierStokesWithSingularityBCFaceElement<ELEMENT>*>(
+	  Face_mesh_for_bc_pt->element_pt(e));
+
+      Vector<ScalableSingularityForNavierStokesElement<ELEMENT>*> sing_fct(Nsingular_fct);
+
+      for(unsigned ising=0; ising<Nsingular_fct; ising++)
+      {
+	sing_fct[ising] = dynamic_cast<ScalableSingularityForNavierStokesElement<ELEMENT>*>(
+	  Singular_fct_element_mesh_pt->element_pt(ising));
+      }
+      
+      // Tell the element about the singular functions
+      el_pt->set_navier_stokes_sing_el_pt(sing_fct);
+    }
+  }
+  
   // Apply bcs
   apply_boundary_conditions();
 
@@ -958,7 +1540,16 @@ void FibreInTwoDBoxProblem<ELEMENT>::complete_problem_setup()
 //========================================================================
 template<class ELEMENT>
 void FibreInTwoDBoxProblem<ELEMENT>::apply_boundary_conditions()
-{  
+{
+  // local shorthand for linear and angular velocites
+  double vel_x          = Global_Physical_Variables::plate_velocity[0];
+  double vel_y          = Global_Physical_Variables::plate_velocity[1];
+  double boundary_vel_x = Global_Physical_Variables::boundary_velocity[0];
+  double boundary_vel_y = Global_Physical_Variables::boundary_velocity[1];
+	
+  double omega_plate    = Global_Physical_Variables::angular_velocity_plate;
+  double omega_boundary = Global_Physical_Variables::angular_velocity_boundary;
+  
   // Set the boundary conditions for this problem: All nodes are
   // free by default -- just pin the ones that have Dirichlet conditions
   // here.
@@ -975,13 +1566,7 @@ void FibreInTwoDBoxProblem<ELEMENT>::apply_boundary_conditions()
 	Vector<double> x(2);	
 	x[0] = node_pt->x(0);
 	x[1] = node_pt->x(1);
-
-	// local shorthand for linear and angular velocites
-	double vel_x          = Global_Physical_Variables::plate_velocity[0];
-	double vel_y          = Global_Physical_Variables::plate_velocity[1];
-	double omega_plate    = Global_Physical_Variables::angular_velocity_plate;
-	double omega_boundary = Global_Physical_Variables::angular_velocity_boundary;
-	
+		
 	// compute distance from centre of rotation to this node
 	double r_x   = x[0] - Global_Physical_Variables::centre_of_rotation[0];
 	double r_y   = x[1] - Global_Physical_Variables::centre_of_rotation[1];
@@ -999,7 +1584,7 @@ void FibreInTwoDBoxProblem<ELEMENT>::apply_boundary_conditions()
 	  node_pt->pin(0);
 	  node_pt->pin(1);
 	
-	  // set 'em
+	  // set 'em // QUEHACERES
 	  node_pt->set_value(0, u);
 	  node_pt->set_value(1, v);
 	}
@@ -1012,8 +1597,8 @@ void FibreInTwoDBoxProblem<ELEMENT>::apply_boundary_conditions()
 	  node_pt->pin(1);
 	  
 	  // no slip and no penetration on outer walls
-	  node_pt->set_value(0, 0.0);
-	  node_pt->set_value(1, 0.0);
+	  node_pt->set_value(0, boundary_vel_x);
+	  node_pt->set_value(1, boundary_vel_y);
 	}
 	else 
 	{
@@ -1022,6 +1607,70 @@ void FibreInTwoDBoxProblem<ELEMENT>::apply_boundary_conditions()
       }
       
   } // end loop over boundaries
+  
+  // Free values on boundary if Lagrange multiplier is used
+  // to enforce bc for sum of FE soln and singuar fct
+  if (CommandLineArgs::command_line_flag_has_been_set("--enforce_dirichlet_bcs_by_lagrange_multipliers"))
+  {
+    // Now unpin nodal values where the bc conditions are enforced
+    // by Lagrange multipliers to ensure that the sum of FE and singular
+    // solution is correct
+    unsigned nel = Face_mesh_for_bc_pt->nelement();
+    for (unsigned e=0; e<nel; e++)
+    {
+      // Get element
+      NavierStokesWithSingularityBCFaceElement<ELEMENT>* el_pt =
+	dynamic_cast<NavierStokesWithSingularityBCFaceElement<ELEMENT>*>(
+	  Face_mesh_for_bc_pt->element_pt(e));
+     
+      // Specify desired nodal values for compound solution
+      unsigned nnod = el_pt->nnode();
+
+      // matrix to store velocities at each boundary node
+      DenseMatrix<double> nodal_boundary_value(nnod, Dim);
+
+      // Unpin the FE part of the solution
+      for (unsigned j=0; j<nnod; j++)
+      {
+	for(unsigned i=0; i<Dim; i++)
+	{
+	  el_pt->unpin_u_fe_at_specified_local_node(j, i);
+	}
+		
+	Node* node_pt = el_pt->node_pt(j);
+
+	Vector<double> x(2);
+	x[0] = node_pt->x(0);
+	x[1] = node_pt->x(1);
+
+	// find the boundaries this node is on
+	std::set<unsigned>* boundaries_set;
+	node_pt->get_boundaries_pt(boundaries_set);
+
+	// assuming BCs are continuous so doesn't matter if node is on multiple
+	// boundaries, just take the first
+	std::set<unsigned>::iterator boundaries_iter = (*boundaries_set).begin();
+	unsigned first_boundary = *boundaries_iter;
+	
+	// get velocity from boundary conditions at this point
+	Vector<double> u(Dim);
+	// u = Global_Physical_Variables::u_BC(first_boundary);
+	u[0] = boundary_vel_x;
+	u[1] = boundary_vel_y;
+	
+	// assign to the matrix of nodal values
+	for(unsigned i=0; i<Dim; i++)
+	{
+	  nodal_boundary_value(j,i) = u[i];
+	}
+      }
+      
+      // Tell the element about these nodal boundary values
+      el_pt->set_nodal_boundary_values(nodal_boundary_value);
+      
+    } // end loop over BC face elements
+    
+  } // end if(enforced-by-lagrange-mpy)
  
 } // end set bc
 
@@ -1030,7 +1679,7 @@ void FibreInTwoDBoxProblem<ELEMENT>::apply_boundary_conditions()
 /// Doc the solution
 //========================================================================
 template<class ELEMENT>
-void FibreInTwoDBoxProblem<ELEMENT>::doc_solution(DocInfo& doc_info)
+void FibreInTwoDBoxProblem<ELEMENT>::doc_solution()
 {
   ofstream some_file;
   char filename[100];
@@ -1044,38 +1693,44 @@ void FibreInTwoDBoxProblem<ELEMENT>::doc_solution(DocInfo& doc_info)
     npts = 10;
     
     // Output solution
-    sprintf(filename,"%s/soln%i.dat",doc_info.directory().c_str(),
-	    doc_info.number());
+    sprintf(filename,"%s/soln%i.dat", Doc_info.directory().c_str(),
+	    Doc_info.number());
     some_file.open(filename);
     Bulk_mesh_pt->output(some_file,npts);
     some_file.close();
   }
 
   // Output solution just using vertices so we can see the mesh
-  sprintf(filename,"%s/coarse_soln%i.dat",doc_info.directory().c_str(),
-	  doc_info.number());
+  sprintf(filename,"%s/coarse_soln%i.dat", Doc_info.directory().c_str(),
+	  Doc_info.number());
   some_file.open(filename);
   
   npts = 2;
   Bulk_mesh_pt->output(some_file,npts);
   some_file.close();
   
-
-  // Work out average element size
-  double av_el_size = 0.0;  
-  unsigned nel = Bulk_mesh_pt->nelement();
-  
+  // Plot "extended solution" showing contributions; also work out
+  // average element size
+  double av_el_size = 0.0;
+  sprintf(filename,"%s/extended_soln%i.dat",Doc_info.directory().c_str(),
+          Doc_info.number());
+  some_file.open(filename);
+  unsigned nel=Bulk_mesh_pt->nelement();
   for (unsigned e=0; e<nel; e++)
   {
-    ELEMENT* el_pt = dynamic_cast<ELEMENT*>(Bulk_mesh_pt->element_pt(e));
-    av_el_size+=el_pt->size();
+    npts=2;
+    ELEMENT* el_pt= dynamic_cast<ELEMENT*>(Bulk_mesh_pt->element_pt(e));
+    
+    el_pt->output_with_various_contributions(some_file, npts);
+    av_el_size += el_pt->size();
   }
+  some_file.close();
   av_el_size/=double(nel);
-
+  
   // Get error
   double error, norm; 
-  sprintf(filename,"%s/error%i.dat",doc_info.directory().c_str(),
-          doc_info.number());
+  sprintf(filename,"%s/error%i.dat", Doc_info.directory().c_str(),
+          Doc_info.number());
   some_file.open(filename);
   Bulk_mesh_pt->compute_error(some_file,
                               Analytic_Functions::get_exact_soln_as_vector,
@@ -1093,8 +1748,8 @@ void FibreInTwoDBoxProblem<ELEMENT>::doc_solution(DocInfo& doc_info)
   oomph_info << std::endl;
 
   // Exact solution
-  sprintf(filename,"%s/exact_soln%i.dat",doc_info.directory().c_str(),
-          doc_info.number());
+  sprintf(filename,"%s/exact_soln%i.dat", Doc_info.directory().c_str(),
+          Doc_info.number());
   some_file.open(filename);
   
   unsigned nplot = 2;
@@ -1118,8 +1773,8 @@ void FibreInTwoDBoxProblem<ELEMENT>::doc_solution(DocInfo& doc_info)
   }
   
   // open x-axis file  
-  sprintf(filename,"%s/soln_along_x_axis%i.dat", doc_info.directory().c_str(),
-	  doc_info.number());
+  sprintf(filename,"%s/soln_along_x_axis%i.dat", Doc_info.directory().c_str(),
+	  Doc_info.number());
   
   some_file.open(filename);
 
@@ -1127,8 +1782,166 @@ void FibreInTwoDBoxProblem<ELEMENT>::doc_solution(DocInfo& doc_info)
   nplot = 2;
   Internal_boundary_surface_mesh_pt->output(some_file, nplot);
   some_file.close();
+
+  // residual vector and Jacobian matrix
+  DoubleVector r;
+  CRDoubleMatrix jac;
+
+  // get 'em
+  get_jacobian(r,jac);
+
+  if (CommandLineArgs::command_line_flag_has_been_set("--output_jacobian_sparse"))
+  {
+    sprintf(filename,"%s/jacobian_sparse%i.dat", Doc_info.directory().c_str(),
+	    Doc_info.number());      
+    some_file.open(filename);
+      
+    jac.sparse_indexed_output(some_file);
+
+    some_file.close();
+  }
+
+  if (CommandLineArgs::command_line_flag_has_been_set("--describe_dofs"))
+  {
+    sprintf(filename,"%s/describe_dofs.dat", Doc_info.directory().c_str());
+    some_file.open(filename);
+    some_file << "test\n";
+    describe_dofs(some_file);
+    
+    some_file.close();
+  }
+  if (CommandLineArgs::command_line_flag_has_been_set("--describe_nodes"))
+  {
+    sprintf(filename,"%s/describe_nodes.dat", Doc_info.directory().c_str());
+    some_file.open(filename);
+
+    for(unsigned j=0; j<Bulk_mesh_pt->nnode(); j++)
+    {
+      // grab the node
+      Node* node_pt = Bulk_mesh_pt->node_pt(j);
+
+      // get it's coordinates
+      double x = node_pt->x(0);
+      double y = node_pt->x(1);
+
+      some_file << j << " " << x << " " << y << std::endl;
+    }
+    
+    some_file.close();
+  }
+
+  if (!CommandLineArgs::command_line_flag_has_been_set
+      ("--dont_subtract_singularity"))
+  {
+    for(unsigned ising=0; ising<Nsingular_fct; ising++)
+    {
+      oomph_info 
+	<< "Amplitude of singular function " << ising << ": "
+	<< dynamic_cast<TemplateFreeScalableSingularityForNavierStokesElement*>(
+	  Singular_fct_element_mesh_pt->element_pt(ising))-> 
+	amplitude_of_singular_fct() << std::endl;
+    }
+  }
+
+  if (CommandLineArgs::command_line_flag_has_been_set("--output_z2_error"))
+  {
+    // grab the error in each element from the Z2 estimator
+    Vector<double> elemental_error(Bulk_mesh_pt->nelement());
+    Mesh* mesh_pt = dynamic_cast<Mesh*>(Bulk_mesh_pt);
+    
+    Bulk_mesh_pt->spatial_error_estimator_pt()->get_element_errors(mesh_pt, elemental_error);
+
+    double z2_global_sum = 0;
+    
+    // sum the errors to get a global measure    
+    for(Vector<double>::iterator it = elemental_error.begin(); it != elemental_error.end(); it++)
+    {
+      z2_global_sum += *it;
+    }
+    sprintf(filename,"%s/global_z2_error.dat", Doc_info.directory().c_str());
+    some_file.open(filename);
+
+    some_file << z2_global_sum << std::endl;
+    some_file.close();
+
+    oomph_info << "Global Z2 error: " << z2_global_sum << std::endl;
+  }
+  
+  // increment the solution numbering
+  Doc_info.number()++;
   
 } // end_of_doc_solution
+
+template<class ELEMENT>
+void FibreInTwoDBoxProblem<ELEMENT>::impose_fake_singular_amplitude()
+{
+  // loop over the singular functions we're subtracting
+  for(unsigned ising=0; ising<Nsingular_fct; ising++)
+  {
+    ScalableSingularityForNavierStokesElement<ELEMENT>* el_pt =
+      dynamic_cast<ScalableSingularityForNavierStokesElement<ELEMENT>*>
+      (Singular_fct_element_mesh_pt->element_pt(ising));
+  
+    // Change r_C so that C is assigned directly
+    double imposed_amplitude = Global_Physical_Variables::singular_amplitude_for_debug;
+    el_pt->impose_singular_fct_amplitude(imposed_amplitude);
+  }
+}
+
+//== start of set_values_to_singular_solution ============================
+/// Function to assign the singular solution to all nodes of the mesh
+//========================================================================
+template<class ELEMENT>
+void FibreInTwoDBoxProblem<ELEMENT>::set_values_to_singular_solution()
+{
+  // get the number of nodes in the mesh
+  unsigned nnode = Bulk_mesh_pt->nnode();
+  
+  for(unsigned i=0; i<nnode; i++)
+  {
+    // get a pointer to this node
+    Node* node_pt = Bulk_mesh_pt->node_pt(i);
+
+    // get the position of this node
+    Vector<double> x(2, 0.0);
+    x[0] = node_pt->x(0);
+    x[1] = node_pt->x(1);
+
+    // get the singular solution at this point
+    Vector<double> u(3, 0.0);
+
+    int boundary_id = -1;
+    if(node_pt->is_on_boundary(Global_Physical_Variables::Inner_plate_boundary))
+      boundary_id = Global_Physical_Variables::Inner_plate_boundary;
+    else if(node_pt->is_on_boundary(Global_Physical_Variables::Inner_plate_boundary_upper))
+      boundary_id = Global_Physical_Variables::Inner_plate_boundary_upper;
+
+    // loop over the singular functions we're subtracting
+    for(unsigned ising=0; ising<Nsingular_fct; ising++)
+    {
+      // call the singular elements analytic function
+      Vector<double> u_ising =
+	dynamic_cast<ScalableSingularityForNavierStokesElement<ELEMENT>*>(
+	  Singular_fct_element_mesh_pt->element_pt(ising))->unscaled_singular_fct(x, boundary_id);
+
+      // add this onto the total 
+      for(unsigned j=0; j<Dim+1; j++)
+      {
+	u[j] += u_ising[j];
+      }
+    }
+    
+    // assign the velocities
+    node_pt->set_value(0, u[0]);
+    node_pt->set_value(1, u[1]);
+
+    // this is a bit hacky but fuck it
+    if(node_pt->nvalue() == 3 || node_pt->nvalue() == 5)
+    {
+      node_pt->set_value(2, u[2]);
+    }
+  }
+}
 
 ////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////
@@ -1145,8 +1958,7 @@ int main(int argc, char **argv)
   CommandLineArgs::setup(argc,argv);
   
   // results directory
-  string dir = "RESLT"; 
-  CommandLineArgs::specify_command_line_flag("--dir", &dir);
+  CommandLineArgs::specify_command_line_flag("--dir", &Global_Physical_Variables::dir);
 
   CommandLineArgs::specify_command_line_flag("-output_hi_res_soln");
   
@@ -1177,6 +1989,14 @@ int main(int argc, char **argv)
   CommandLineArgs::specify_command_line_flag("--angular_velocity_plate",
 					     &Global_Physical_Variables::angular_velocity_plate);
 
+    // specify the x-component of the velocity at the outer boundaries
+  CommandLineArgs::specify_command_line_flag("--boundary_velocity_x", 
+					     &Global_Physical_Variables::boundary_velocity[0]);
+  
+  // specify the y-component of the velocity at the outer boundaries
+  CommandLineArgs::specify_command_line_flag("--boundary_velocity_y", 
+					     &Global_Physical_Variables::boundary_velocity[1]);
+  
   // specify the boundaries' angular velocity
   CommandLineArgs::specify_command_line_flag("--angular_velocity_boundary",
 					     &Global_Physical_Variables::angular_velocity_boundary);
@@ -1199,44 +2019,88 @@ int main(int argc, char **argv)
   // set the y-coordinate of the top edge of the domain
   CommandLineArgs::specify_command_line_flag("--top_edge_y",
 					     &Global_Physical_Variables::top_edge_y);
-    
+
+  // set the x-coordinate of the left edge of the domain
+  CommandLineArgs::specify_command_line_flag("--left_edge_x",
+					     &Global_Physical_Variables::L_edge_x);
+
+  // set the x-coordinate of the right edge of the domain
+  CommandLineArgs::specify_command_line_flag("--right_edge_x",
+					     &Global_Physical_Variables::R_edge_x);
+  
+  // just compute with pure finite elements rather than with the augmented singular elements
+  CommandLineArgs::specify_command_line_flag("--dont_subtract_singularity");
+
+  // assign the singular solution to all nodal values, for validation
+  CommandLineArgs::specify_command_line_flag("--set_values_to_singular_solution");
+  
+  // output the Jacobian matrix in sparse-indexed form
+  CommandLineArgs::specify_command_line_flag("--output_jacobian_sparse");
+
+  // output the Z2 error at the locations of the singularities
+  CommandLineArgs::specify_command_line_flag("--output_z2_error");
+  
+  // output description of dofs
+  CommandLineArgs::specify_command_line_flag("--describe_dofs");
+
+  // output the location of each node
+  CommandLineArgs::specify_command_line_flag("--describe_nodes");
+  
+  // fake singular amplitude for debug
+  CommandLineArgs::specify_command_line_flag("--set_sing_amplitude",
+	&Global_Physical_Variables::singular_amplitude_for_debug);
+  
+  // use Lagrange multipliers to enforce dirichlet boundary conditions
+  CommandLineArgs::specify_command_line_flag("--enforce_dirichlet_bcs_by_lagrange_multipliers");
+
+  // switch off the hi-res regions for debug
+  CommandLineArgs::specify_command_line_flag("--no_hi_res_regions");
+  
   // Parse command line
   CommandLineArgs::parse_and_assign(); 
   
   // Doc what has actually been specified on the command line
   CommandLineArgs::doc_specified_flags();
-    
-  // Set up doc info
-  // ---------------
- 
-  // Label for output
-  DocInfo doc_info;
-
-  // don't run if the output folder doesn't exist
-  doc_info.enable_error_if_directory_does_not_exist();
-  
-  // Set output directory
-  doc_info.set_directory(dir.c_str());
- 
-  // Step number
-  doc_info.number() = 0;
 
   // QUEHACERES for curved plates there seems to be a mismatch of 2e-14...
   ToleranceForVertexMismatchInPolygons::Tolerable_error = 3e-14;
-  
+
+  if (CommandLineArgs::command_line_flag_has_been_set("--no_hi_res_regions") )
+  {
+    Global_Physical_Variables::include_hi_res_regions = false;
+    Global_Physical_Variables::Inner_plate_boundary_upper = 4;
+  }
+      
   // Build the problem with Triangular Taylor Hood elements
-  FibreInTwoDBoxProblem<ProjectableTaylorHoodElement<TTaylorHoodElement <2> > > problem;
+  FibreInTwoDBoxProblem<ProjectableTaylorHoodElement<MyTNavierStokesElement <2,3> > > problem;
+
+  // set the global pointer
+  Global_Physical_Variables::Plate_pt = problem.plate_pt();
+
+  // are we imposing the amplitude directly and bypassing the calculation?
+  if (CommandLineArgs::command_line_flag_has_been_set("--set_sing_amplitude") )
+  {
+    if (!CommandLineArgs::command_line_flag_has_been_set("--dont_subtract_singularity"))
+    {
+      problem.impose_fake_singular_amplitude();
+    }
+  }
+
+  if (CommandLineArgs::command_line_flag_has_been_set("--set_values_to_singular_solution"))
+  {
+    problem.set_values_to_singular_solution();
+  }
 
   // doc initial conditions
-  problem.doc_solution(doc_info);
-  doc_info.number()++;
+  problem.doc_solution();
+
+  problem.max_residuals() = 1e3;
   
   // solve the bloody thing
   problem.newton_solve();
 
   // doc it
-  problem.doc_solution(doc_info);
-  doc_info.number()++;
+  problem.doc_solution();
   
   return 0;
 }

@@ -1,3 +1,5 @@
+#ifndef OOMPH_UNSTRUCTURED_MOFFAT_MESH_HEADER
+#define OOMPH_UNSTRUCTURED_MOFFAT_MESH_HEADER
 // Christian Vaquero-Stainer
 // 21/11/19
 // 
@@ -38,121 +40,14 @@ double udouble(double val)
   return val * sgn(val);
 }
 
-
-//=====start_of_plate======================================================
-/// \short Simple circle in 2D space.
-/// \f[ x = X_c + R \cos(\zeta)  \f]
-/// \f[ y = Y_c + R \sin(\zeta)  \f]
-//=========================================================================
-class Plate : public GeomObject
-{
-public:
-  
-  /// Constructor:  Pass x and y-coords of centre and radius
-Plate(const double& x_c, const double& y_c, const double& r,
-      const double& zeta_start, const double& zeta_end,
-      double& hi_res_zeta = Global_Physical_Variables::high_res_region_zeta) :
-  GeomObject(1,2), X_c(x_c), Y_c(y_c), R(r), Zeta_start(zeta_start),
-    Zeta_end(zeta_end)
-  {
-    Hi_res_zeta_start = Zeta_start + hi_res_zeta;
-    Hi_res_zeta_end   = Zeta_end   - hi_res_zeta;
-  }
-  
-  /// \short Position Vector at Lagrangian coordinate zeta 
-  void position(const Vector<double>& zeta, Vector<double>& r) const
-  {
-    // Position vector
-    r[0] = X_c + R*cos(zeta[0]);
-    r[1] = Y_c + R*sin(zeta[0]);
-  }
-  
-  /// \short Position Vector at Lagrangian coordinate zeta  at time level t
-  /// (t=0: present; t>0: previous level). Steady object, so we 
-  /// simply forward the call to the steady version.
-  void position(const unsigned& t, const Vector<double>& zeta,
-		Vector<double>& r) const
-  {
-    position(zeta,r);
-  }
-
-  double hi_res_zeta_start()
-  {
-    return Hi_res_zeta_start;
-  }
-
-  double hi_res_zeta_end()
-  {
-    return Hi_res_zeta_end;
-  }
-  
-  /// \short Position of the intersection point between the plate and the
-  /// circle bounding the high-resolution region on the left side
-  void hi_res_intersection_position_start(Vector<double>& r)
-  {
-    Vector<double> zeta(1);
-    zeta[0] = Hi_res_zeta_start;
-    position(zeta, r);
-  }
-
-  /// \short Position of the intersection point between the plate and the
-  /// circle bounding the high-resolution region on the right side  
-  void hi_res_intersection_position_end(Vector<double>& r)
-  {
-    Vector<double> zeta(1);
-    zeta[0] = Hi_res_zeta_end;
-    position(zeta, r);
-  }
-    
-  double x_c()
-  {
-    return X_c;
-  }
-  
-  double y_c()
-  {
-    return Y_c;
-  }
-
-  double zeta_start()
-  {
-    return Zeta_start;
-  }
-
-  double zeta_end()
-  {
-    return Zeta_end;
-  }
-  
-protected:
-  
-  /// X-coordinate of centre
-  double X_c;
-  
-  /// Y-coordinate of centre
-  double Y_c;
-  
-  /// Radius
-  double R;
-
-  /// Zeta for the start and end of the curve
-  double Zeta_start;
-  double Zeta_end;
-  
-  /// Intrinsic coordinate of intersection with high-resolution region
-  double Hi_res_zeta_start;
-  double Hi_res_zeta_end;
-  
-}; // end of Plate class
-
-
 //=====================================================================
 /// Helper function to build the mesh; assumed to live in namespace
 /// where dimensions of mesh are defined
 //=====================================================================
 /* TriangleMesh<ELEMENT>* build_the_mesh(const double& uniform_element_area) */
 template<class ELEMENT>
-RefineableTriangleMesh<ELEMENT>* build_the_mesh(const double& uniform_element_area)
+RefineableTriangleMesh<ELEMENT>* build_the_mesh(const double& uniform_element_area,
+						Plate* plate_pt)
 {
  
   // The domain is defined by 2 outer boundaries
@@ -207,20 +102,8 @@ RefineableTriangleMesh<ELEMENT>* build_the_mesh(const double& uniform_element_ar
 
   // =========================================================
   // Inner boundaries
-  Vector<TriangleMeshOpenCurve*> inner_open_boundary_pt(7);
-
-
-  // centre of the circle; central along x-axis of plate, and with
-  // a y coordinate such that the two plate ends touch the edge of the circle
-  double x_c = 0.0;
-  double y_c = sqrt( pow(plate_radius_of_curvature,2) - pow(plate_radius, 2) );
-
-  // The intrinsic coordinates for the beginning and end of the curve
-  double s_plate_start = atan2(-y_c, -plate_radius - x_c);
-  double s_plate_end   = atan2(-y_c,  plate_radius - x_c);
-  
-  // Make GeomObject representing the plate
-  Plate* plate_pt = new Plate(x_c, y_c, plate_radius_of_curvature, s_plate_start, s_plate_end);
+  unsigned n_inner_boundaries = include_hi_res_regions ? 7 : 3;
+  Vector<TriangleMeshOpenCurve*> inner_open_boundary_pt(n_inner_boundaries);
 
   // get the coordinates of the intersection between the plate and the left high-res bounding
   // circle
@@ -266,15 +149,10 @@ RefineableTriangleMesh<ELEMENT>* build_the_mesh(const double& uniform_element_ar
 
   // =========================================================
   // Boundary 3: The plate
-
+    
   // Number of segments used for representing the curvlinear internal boundary
-  unsigned n_segments = 20;
+  unsigned n_segments = plate_pt->nsegment();
  
-  // State the vertex number for connection on the destination
-  // boundaries
-  unsigned vertex_to_connect_initial = 1;
-  unsigned vertex_to_connect_final   = 0;
-  
   TriangleMeshCurviLine* plate_boundary_curviline_pt =
     new TriangleMeshCurviLine(plate_pt, plate_pt->zeta_start(),
 			      plate_pt->zeta_end(), n_segments, Inner_plate_boundary);
@@ -295,73 +173,7 @@ RefineableTriangleMesh<ELEMENT>* build_the_mesh(const double& uniform_element_ar
   // =========================================================
   // Hi-res left region  
   Vector<TriangleMeshCurveSection*> hi_res_left_boundary_curviline_pt(2);
-  
-  // =========================================================
-  // Boundary 5: Upper half of left hi-res region
-
-  // centre of the circle
-  double left_edge_x = -plate_radius;
-  double left_edge_y = 0.0;
-
-  Circle* left_high_res_circle_pt =
-    new Circle(left_edge_x, left_edge_y, high_res_region_radius_left);
-
-  // Number of segments used for representing the curvlinear internal boundary
-  n_segments = 20;
-
-
-  // angle that the point of intersection of the plate and the left hi-res region boundary
-  // makes to the centre of the plate's radius of curvature 
-  double connection_angle = atan2(r_intersection_left[1] - plate_pt->y_c(),
-				  r_intersection_left[0] - plate_pt->x_c());
-  
-  // The intrinsic coordinates for the beginning and end of the curve
-  double s_hi_res_left_start = atan2(r_intersection_left[1] - left_edge_y,
-				     r_intersection_left[0] - left_edge_x);
-  
-  double s_hi_res_left_end   = MathematicalConstants::Pi;
-  
-  // build the upper semi-circle
-  TriangleMeshCurviLine* high_res_left_upper_curviline_pt =
-    new TriangleMeshCurviLine(left_high_res_circle_pt,
-			      s_hi_res_left_start, s_hi_res_left_end, n_segments,
-			      Inner_hi_res_region_left_upper);
-
-  // add to array of closed curves
-  hi_res_left_boundary_curviline_pt[0] = high_res_left_upper_curviline_pt;
-
-  // connect the start and end points to the plate and the left internal region boundary
-  high_res_left_upper_curviline_pt->
-    connect_initial_vertex_to_curviline(plate_boundary_curviline_pt,
-					plate_pt->hi_res_zeta_start(), tolerance);
-  high_res_left_upper_curviline_pt->
-    connect_final_vertex_to_polyline(left_region_boundary_polyline_pt, 1);
-
-   Vector<TriangleMeshCurveSection*> high_res_curve_section_pt(1);
-   high_res_curve_section_pt[0] = high_res_left_upper_curviline_pt;
-  inner_open_boundary_pt[2] = new TriangleMeshOpenCurve(high_res_curve_section_pt);
-  
-  // =========================================================
-  // Boundary 6: Lower half of left hi-res region
-  
-  // build the lower semi-circle
-  TriangleMeshCurviLine* high_res_left_lower_curviline_pt =
-    new TriangleMeshCurviLine(left_high_res_circle_pt,
-			      -s_hi_res_left_end, s_hi_res_left_start, n_segments,
-			      Inner_hi_res_region_left_lower);
-
-  high_res_left_lower_curviline_pt->connect_initial_vertex_to_curviline(
-    high_res_left_upper_curviline_pt, s_hi_res_left_end);
-    
-  high_res_left_lower_curviline_pt->connect_final_vertex_to_curviline(
-    high_res_left_upper_curviline_pt, s_hi_res_left_start);
-
-  hi_res_left_boundary_curviline_pt[1] = high_res_left_lower_curviline_pt;
-
-  Vector<TriangleMeshCurveSection*> high_res_lower_curve_section_pt(1);
-   high_res_lower_curve_section_pt[0] = high_res_left_lower_curviline_pt;
-  inner_open_boundary_pt[3] = new TriangleMeshOpenCurve(high_res_lower_curve_section_pt);
-
+      
   // =========================================================
   // Boundary 4: Right region boundary
  
@@ -387,7 +199,8 @@ RefineableTriangleMesh<ELEMENT>* build_the_mesh(const double& uniform_element_ar
     connect_initial_vertex_to_curviline(plate_boundary_curviline_pt,
 					plate_pt->zeta_end(), tolerance);
 
-  vertex_to_connect_final = 3;
+  // State the vertex number for connection on the destination boundaries
+  unsigned vertex_to_connect_final = 3;
   
   right_region_boundary_polyline_pt ->
     connect_final_vertex_to_polyline(upper_boundary_pt, vertex_to_connect_final);
@@ -396,79 +209,156 @@ RefineableTriangleMesh<ELEMENT>* build_the_mesh(const double& uniform_element_ar
   inner_boundary_line3_pt[0] = right_region_boundary_polyline_pt;
   
   // add to array of inner boundaries
-  inner_open_boundary_pt[4] = new TriangleMeshOpenCurve(inner_boundary_line3_pt);
-  
-  // =========================================================
-  // Hi-res right region
-  
-  Vector<TriangleMeshCurveSection*> hi_res_right_boundary_curviline_pt(3);
+  inner_open_boundary_pt[2] = new TriangleMeshOpenCurve(inner_boundary_line3_pt);
 
   // =========================================================
-  // Boundary 7: Upper half of right hi-res region
+  if(include_hi_res_regions)
+  {
+    // Boundary 5: Upper half of left hi-res region
 
-  double right_edge_x = plate_radius;
-  double right_edge_y = 0.0;
+    // centre of the circle
+    double left_edge_x = -plate_radius;
+    double left_edge_y = 0.0;
 
-  Circle* right_high_res_circle_pt =
-    new Circle(right_edge_x, right_edge_y, high_res_region_radius_right);
+    Circle* left_high_res_circle_pt =
+      new Circle(left_edge_x, left_edge_y, high_res_region_radius_left);
 
-  // The intrinsic coordinates for the beginning and end of the curve
-  double s_hi_res_right_start   = 0.0;
-  double s_hi_res_right_end     = atan2(r_intersection_right[1], r_intersection_right[0] - plate_radius);
-  double s_hi_res_right_end_2pi =
-    Additional_Maths_Functions::atan2pi(r_intersection_right[1], r_intersection_right[0] - plate_radius);
+    // The intrinsic coordinates for the beginning and end of the curve
+    double s_hi_res_left_start = atan2(r_intersection_left[1] - left_edge_y,
+				       r_intersection_left[0] - left_edge_x);
   
-  // build the upper semi-circle
-  TriangleMeshCurviLine* high_res_right_upper_curviline_pt =
-    new TriangleMeshCurviLine(right_high_res_circle_pt,
-			      s_hi_res_right_start, s_hi_res_right_end_2pi, n_segments,
-			      Inner_hi_res_region_right_upper);
-
-  // add to array of closed curves
-  hi_res_right_boundary_curviline_pt[0] = high_res_right_upper_curviline_pt;
-
-  // angle that the point of intersection of the plate and the right hi-res region boundary
-  // makes to the centre of the plate's radius of curvature 
-  connection_angle = atan2(r_intersection_right[1] - plate_pt->y_c(),
-			   r_intersection_right[0] - plate_pt->x_c());
-
-  // connect the start and end points to the right internal region boundary and the plate
-  high_res_right_upper_curviline_pt->
-    connect_final_vertex_to_curviline(plate_boundary_curviline_pt,
-  				      plate_pt->hi_res_zeta_end(), tolerance);
-  high_res_right_upper_curviline_pt->
-    connect_initial_vertex_to_polyline(right_region_boundary_polyline_pt, 1);
-
-  // add it to the inner regions array
-  Vector<TriangleMeshCurveSection*> hi_res_right_boundary_curve_sec_pt(1);
-  hi_res_right_boundary_curve_sec_pt[0] = high_res_right_upper_curviline_pt;
-  inner_open_boundary_pt[5] = new TriangleMeshOpenCurve(hi_res_right_boundary_curve_sec_pt);
+    double s_hi_res_left_end   = MathematicalConstants::Pi;
   
-  // =========================================================
-  // Boundary 8: Lower half of right hi-res region
+    // build the upper semi-circle
+    n_segments = 20;
+    TriangleMeshCurviLine* high_res_left_upper_curviline_pt =
+      new TriangleMeshCurviLine(left_high_res_circle_pt,
+				s_hi_res_left_start, s_hi_res_left_end, n_segments,
+				Inner_hi_res_region_left_upper);
 
-  n_segments = 20;
-  // build the lower semi-circle
-  TriangleMeshCurviLine* high_res_right_lower_curviline_pt =
-    new TriangleMeshCurviLine(right_high_res_circle_pt,
-  			      s_hi_res_right_end, s_hi_res_right_start, n_segments,
-  			      Inner_hi_res_region_right_lower);
+    // add to array of closed curves
+    hi_res_left_boundary_curviline_pt[0] = high_res_left_upper_curviline_pt;
+
+    // connect the start and end points to the plate and the left internal region boundary
+    high_res_left_upper_curviline_pt->
+      connect_initial_vertex_to_curviline(plate_boundary_curviline_pt,
+					  plate_pt->hi_res_zeta_start(), tolerance);
+    high_res_left_upper_curviline_pt->
+      connect_final_vertex_to_polyline(left_region_boundary_polyline_pt, 1);
+
+    Vector<TriangleMeshCurveSection*> high_res_curve_section_pt(1);
+    high_res_curve_section_pt[0] = high_res_left_upper_curviline_pt;
   
-  // connect it's end points
-  high_res_right_lower_curviline_pt->
-    connect_final_vertex_to_curviline(high_res_right_upper_curviline_pt,
-  				      s_hi_res_right_start, tolerance);
-
-  high_res_right_lower_curviline_pt->
-    connect_initial_vertex_to_curviline(plate_boundary_curviline_pt,
-  				      connection_angle, tolerance);
-
-  hi_res_right_boundary_curviline_pt[2] = high_res_right_lower_curviline_pt;
   
-  Vector<TriangleMeshCurveSection*> hi_res_right_lower_boundary_curve_sec_pt(1);
-  hi_res_right_lower_boundary_curve_sec_pt[0] = high_res_right_lower_curviline_pt;
-  inner_open_boundary_pt[6] = new TriangleMeshOpenCurve(hi_res_right_lower_boundary_curve_sec_pt);
+    inner_open_boundary_pt[3] = new TriangleMeshOpenCurve(high_res_curve_section_pt);
+  
+  
+    // =========================================================
+    // Boundary 6: Lower half of left hi-res region
+  
+    // build the lower semi-circle
+    TriangleMeshCurviLine* high_res_left_lower_curviline_pt =
+      new TriangleMeshCurviLine(left_high_res_circle_pt,
+				-s_hi_res_left_end, s_hi_res_left_start, n_segments,
+				Inner_hi_res_region_left_lower);
+
+    // connect its end points
+    high_res_left_lower_curviline_pt->connect_initial_vertex_to_curviline(
+      high_res_left_upper_curviline_pt, s_hi_res_left_end);
     
+    high_res_left_lower_curviline_pt->connect_final_vertex_to_curviline(
+      high_res_left_upper_curviline_pt, s_hi_res_left_start);
+
+  
+    hi_res_left_boundary_curviline_pt[1] = high_res_left_lower_curviline_pt;
+
+    Vector<TriangleMeshCurveSection*> high_res_lower_curve_section_pt(1);
+    high_res_lower_curve_section_pt[0] = high_res_left_lower_curviline_pt;
+  
+    if(include_hi_res_regions)
+    { 
+      inner_open_boundary_pt[4] = new TriangleMeshOpenCurve(high_res_lower_curve_section_pt);
+    }
+  
+    // =========================================================
+    // Hi-res right region
+  
+    Vector<TriangleMeshCurveSection*> hi_res_right_boundary_curviline_pt(3);
+
+    // =========================================================
+    // Boundary 7: Upper half of right hi-res region
+
+    double right_edge_x = plate_radius;
+    double right_edge_y = 0.0;
+
+    Circle* right_high_res_circle_pt =
+      new Circle(right_edge_x, right_edge_y, high_res_region_radius_right);
+
+    // The intrinsic coordinates for the beginning and end of the curve
+    double s_hi_res_right_start   = 0.0;
+    double s_hi_res_right_end     = atan2(r_intersection_right[1], r_intersection_right[0] - plate_radius);
+    double s_hi_res_right_end_2pi =
+      Additional_Maths_Functions::atan2pi(r_intersection_right[1], r_intersection_right[0] - plate_radius);
+  
+    // build the upper semi-circle
+    TriangleMeshCurviLine* high_res_right_upper_curviline_pt =
+      new TriangleMeshCurviLine(right_high_res_circle_pt,
+				s_hi_res_right_start, s_hi_res_right_end_2pi, n_segments,
+				Inner_hi_res_region_right_upper);
+
+    // add to array of closed curves
+    hi_res_right_boundary_curviline_pt[0] = high_res_right_upper_curviline_pt;
+
+    // connect the start and end points to the right internal region boundary and the plate
+    high_res_right_upper_curviline_pt->
+      connect_final_vertex_to_curviline(plate_boundary_curviline_pt,
+					plate_pt->hi_res_zeta_end(), tolerance);
+    high_res_right_upper_curviline_pt->
+      connect_initial_vertex_to_polyline(right_region_boundary_polyline_pt, 1);
+
+    // add it to the inner regions array
+    Vector<TriangleMeshCurveSection*> hi_res_right_boundary_curve_sec_pt(1);
+    hi_res_right_boundary_curve_sec_pt[0] = high_res_right_upper_curviline_pt;
+
+    if(include_hi_res_regions)
+    {
+      inner_open_boundary_pt[5] = new TriangleMeshOpenCurve(hi_res_right_boundary_curve_sec_pt);
+    }
+  
+    // =========================================================
+    // Boundary 8: Lower half of right hi-res region
+
+    // catch the case where the plate is either practically or exactly flat, and the
+    // hi-res intersection point is positive
+    if(s_hi_res_right_end > 0 && s_hi_res_right_end < MathematicalConstants::Pi + tolerance)
+    {
+      s_hi_res_right_end = -s_hi_res_right_end;
+    }
+  
+    // build the lower semi-circle
+    TriangleMeshCurviLine* high_res_right_lower_curviline_pt =
+      new TriangleMeshCurviLine(right_high_res_circle_pt,
+				s_hi_res_right_end, s_hi_res_right_start, n_segments,
+				Inner_hi_res_region_right_lower);
+  
+    // connect it's end points
+    high_res_right_lower_curviline_pt->
+      connect_final_vertex_to_curviline(high_res_right_upper_curviline_pt,
+					s_hi_res_right_start, tolerance);
+
+    high_res_right_lower_curviline_pt->
+      connect_initial_vertex_to_curviline(high_res_right_upper_curviline_pt, // plate_boundary_curviline_pt,
+					  s_hi_res_right_end_2pi, tolerance); // connection_angle
+
+    hi_res_right_boundary_curviline_pt[2] = high_res_right_lower_curviline_pt;
+  
+    Vector<TriangleMeshCurveSection*> hi_res_right_lower_boundary_curve_sec_pt(1);
+    hi_res_right_lower_boundary_curve_sec_pt[0] = high_res_right_lower_curviline_pt;
+
+    inner_open_boundary_pt[6] = new TriangleMeshOpenCurve(hi_res_right_lower_boundary_curve_sec_pt);
+    
+  } // end if(include_hi_res_regions)
+  
   // **********************************************************************************
   
   // =========================================================  
@@ -529,17 +419,21 @@ RefineableTriangleMesh<ELEMENT>* build_the_mesh(const double& uniform_element_ar
  
   // Identify regions
   triangle_mesh_parameters.add_region_coordinates(Region_upper, region1_point);
-  triangle_mesh_parameters.add_region_coordinates(Region_hi_res_left_upper,  region2_point);
-  triangle_mesh_parameters.add_region_coordinates(Region_hi_res_left_lower,  region3_point);
-  triangle_mesh_parameters.add_region_coordinates(Region_hi_res_right_upper, region4_point);
-  triangle_mesh_parameters.add_region_coordinates(Region_hi_res_right_lower, region5_point);
 
-  /* // set the higher resolution for the regions around the plate ends */
-  triangle_mesh_parameters.set_target_area_for_region(Region_hi_res_left_upper,  hi_res_element_area);
-  triangle_mesh_parameters.set_target_area_for_region(Region_hi_res_left_lower,  hi_res_element_area);
-  triangle_mesh_parameters.set_target_area_for_region(Region_hi_res_right_upper, hi_res_element_area);
-  triangle_mesh_parameters.set_target_area_for_region(Region_hi_res_right_lower, hi_res_element_area);
+  if(include_hi_res_regions)
+  {
+    triangle_mesh_parameters.add_region_coordinates(Region_hi_res_left_upper,  region2_point);
+    triangle_mesh_parameters.add_region_coordinates(Region_hi_res_left_lower,  region3_point);
+    triangle_mesh_parameters.add_region_coordinates(Region_hi_res_right_upper, region4_point);
+    triangle_mesh_parameters.add_region_coordinates(Region_hi_res_right_lower, region5_point);
 
+    // set the higher resolution for the regions around the plate ends
+    triangle_mesh_parameters.set_target_area_for_region(Region_hi_res_left_upper,  hi_res_element_area);
+    triangle_mesh_parameters.set_target_area_for_region(Region_hi_res_left_lower,  hi_res_element_area);
+    triangle_mesh_parameters.set_target_area_for_region(Region_hi_res_right_upper, hi_res_element_area);
+    triangle_mesh_parameters.set_target_area_for_region(Region_hi_res_right_lower, hi_res_element_area);
+  }
+  
   // Build the damn thing
   RefineableTriangleMesh<ELEMENT>* Bulk_mesh_pt =
     new RefineableTriangleMesh<ELEMENT>(triangle_mesh_parameters);
@@ -548,3 +442,5 @@ RefineableTriangleMesh<ELEMENT>* build_the_mesh(const double& uniform_element_ar
  
   return Bulk_mesh_pt;
 }
+
+#endif
