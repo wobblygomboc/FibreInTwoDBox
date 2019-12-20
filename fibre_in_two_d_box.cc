@@ -836,34 +836,39 @@ FibreInTwoDBoxProblem<ELEMENT> :: FibreInTwoDBoxProblem() : Newton_step_counter(
   // Step number
   Doc_info.number() = 0;
 
+  if (CommandLineArgs::command_line_flag_has_been_set("--circular_plate"))
+  {
+    // shorthand
+    double r_c = Global_Physical_Variables::plate_radius_of_curvature;
   
-  Vector<double> start_coords(2, 0.0);
-  Vector<double> end_coords(2, 0.0);
-  
-  start_coords[0] = - Global_Physical_Variables::plate_radius;
-  end_coords[0]   = + Global_Physical_Variables::plate_radius;
-  
-  Plate_pt = new FlatPlate(start_coords, end_coords,
-  				  Global_Physical_Variables::high_res_region_zeta);
+    // centre of the circle; central along x-axis of plate, and with
+    // a y coordinate such that the two plate ends touch the edge of the circle
+    double x_c = 0.0;
+    double y_c = sqrt( pow(r_c,2) - pow(Global_Physical_Variables::plate_radius, 2) );
 
-  // QUEHACERES uncomment for circular plate ------------------------------
-  // // shorthand
-  // double r_c = Global_Physical_Variables::plate_radius_of_curvature;
+    // intrinsic coordinates of the start and end of the plate
+    double s_plate_start = atan2(-y_c, -Global_Physical_Variables::plate_radius);
+    double s_plate_end   = atan2(-y_c, +Global_Physical_Variables::plate_radius);
   
-  // // centre of the circle; central along x-axis of plate, and with
-  // // a y coordinate such that the two plate ends touch the edge of the circle
-  // double x_c = 0.0;
-  // double y_c = sqrt( pow(r_c,2) - pow(Global_Physical_Variables::plate_radius, 2) );
+    // Make GeomObject representing a circular plate
+      Plate* plate_pt =
+      new CircularPlate(x_c, y_c, r_c, s_plate_start, s_plate_end,
+			Global_Physical_Variables::high_res_region_zeta);
+  }
+  else 
+  {
+    // default is flat plate
+    
+    Vector<double> start_coords(2, 0.0);
+    Vector<double> end_coords(2, 0.0);
+  
+    start_coords[0] = - Global_Physical_Variables::plate_radius;
+    end_coords[0]   = + Global_Physical_Variables::plate_radius;
 
-  // // intrinsic coordinates of the start and end of the plate
-  // double s_plate_start = atan2(-y_c, -Global_Physical_Variables::plate_radius);
-  // double s_plate_end   = atan2(-y_c, +Global_Physical_Variables::plate_radius);
   
-  // Make GeomObject representing a circular plate
-  // Plate* plate_pt =
-  //   new CircularPlate(x_c, y_c, r_c, s_plate_start, s_plate_end,
-  // 		       Global_Physical_Variables::high_res_region_zeta);
-  // --------------------------------------------------------------------
+    Plate_pt = new FlatPlate(start_coords, end_coords,
+			     Global_Physical_Variables::high_res_region_zeta);
+  }
 
   
   // Build the mesh
@@ -2055,6 +2060,9 @@ int main(int argc, char **argv)
 
   // switch off the hi-res regions for debug
   CommandLineArgs::specify_command_line_flag("--no_hi_res_regions");
+
+  // switch from a flat plate to a circular plate
+  CommandLineArgs::specify_command_line_flag("--circular_plate");
   
   // Parse command line
   CommandLineArgs::parse_and_assign(); 
