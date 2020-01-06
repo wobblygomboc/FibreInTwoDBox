@@ -200,6 +200,37 @@ namespace Global_Physical_Variables
     
     return u_bc;
   }
+
+  // function to take an (r,theta) coordinate and return coordinates of N points along that line
+  void get_line_coordinates( const double r, const double theta,
+			     Vector<Vector<double> >& coordinates,
+			     Vector<double> origin = Vector<double>(2,0.0),
+			     unsigned N=101)
+  {
+    // get size of the radial increment (1 fewer because we'll plot at the origin and the end point)
+    double dr = r / double(N-1);
+
+    // resize the output array to hold N coordinate pairs
+    coordinates.resize(N);
+ 
+    // loop over the plot points
+    for(unsigned i=0; i<N; i++)
+    {
+      // get radius of current plot point
+      double rho = dr * double(i);
+
+      double x = rho * cos(theta) + origin[0];
+      double y = rho * sin(theta) + origin[1];
+      
+      // resize this entry to hold the x,y values
+      coordinates[i].resize(2);
+
+      // set 'em
+      coordinates[i][0] = x;
+      coordinates[i][1] = y;
+    }
+  }
+
 } // end_of_namespace
 
 //==start_of_namespace==============================
@@ -1870,6 +1901,46 @@ void FibreInTwoDBoxProblem<ELEMENT>::doc_solution()
     some_file.close();
 
     oomph_info << "Global Z2 error: " << z2_global_sum << std::endl;
+  }
+
+  // =======================================================
+
+  Vector<double> origin(2, 0.0);
+
+  origin[0] = -Global_Physical_Variables::plate_radius;
+  
+  // loop over the number of angles we're gonna plot
+  unsigned ntheta = 7;
+  unsigned npoints = 1001;
+
+  double radius = 0.75*(
+    Global_Physical_Variables::plate_radius - Global_Physical_Variables::L_edge_x);
+  
+  for(unsigned i=0; i<ntheta; i++)
+  {
+    // angle of this plot point
+    double theta = (i+1) * 2.0 * MathematicalConstants::Pi/(ntheta+1);
+
+    // output cartesian coordinates
+    Vector<Vector<double> > coords_xy;
+
+    // get xy coordinates
+    Global_Physical_Variables::get_line_coordinates(radius, theta, coords_xy, origin, npoints);
+
+    // create the visualiser for this angle
+    LineVisualiser line_visualiser(Bulk_mesh_pt, coords_xy);
+
+    // open file
+    sprintf( filename, "%s/soln_theta=%f_%i.dat", Doc_info.directory().c_str(),
+	     theta, Doc_info.number());
+
+    some_file.open(filename);
+
+    // print out the points
+    line_visualiser.output(some_file);
+
+    // done with this file
+    some_file.close();
   }
   
   // increment the solution numbering
