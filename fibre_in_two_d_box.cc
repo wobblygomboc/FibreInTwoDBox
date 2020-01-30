@@ -137,6 +137,10 @@ namespace Global_Physical_Variables
   // angular coordinate along plate where the circles bounding the high-resolution regions
   // intersect. 0.17rad ~10deg
   double high_res_region_zeta = 0.1;
+
+  // fraction of the total zeta which will be used as the radius
+  // for the high res region circle
+  double high_res_region_zeta_fraction = 0.1;
   
   /// Reynolds number
   double Re = 0.0; 
@@ -165,13 +169,11 @@ namespace Global_Physical_Variables
     First_inner_boundary            = 2,
     Inner_region_boundary_left      = 2,
     Inner_plate_boundary            = 3,
-    Inner_region_boundary_right     = 4,
-    Inner_region_boundary_right_con = 5,
-    Inner_hi_res_region_left_upper  = 6,
-    Inner_hi_res_region_left_lower  = 7,
-    Inner_hi_res_region_right_upper = 8,
-    Inner_hi_res_region_right_connecting = 9,
-    Inner_hi_res_region_right_lower = 10,
+    Inner_region_boundary_right     = 4,    
+    Inner_hi_res_region_left_upper  = 5,
+    Inner_hi_res_region_left_lower  = 6,
+    Inner_hi_res_region_right_upper = 7,
+    Inner_hi_res_region_right_lower = 8,
     Last_inner_boundary
   };
 
@@ -207,17 +209,17 @@ namespace Global_Physical_Variables
 			     Vector<double> origin = Vector<double>(2,0.0),
 			     unsigned N=101)
   {
-    // get size of the radial increment (1 fewer because we'll plot at the origin and the end point)
-    double dr = r / double(N-1);
+    // get size of the radial increment 
+    double dr = r / double(N);
 
     // resize the output array to hold N coordinate pairs
     coordinates.resize(N);
  
-    // loop over the plot points
+    // loop over the plot points (i starts at 1 so we don't do r=0)
     for(unsigned i=0; i<N; i++)
     {
       // get radius of current plot point
-      double rho = dr * double(i);
+      double rho = dr * double(i+1);
 
       double x = rho * cos(theta) + origin[0];
       double y = rho * sin(theta) + origin[1];
@@ -687,7 +689,19 @@ private:
     
   /// Create face elements
   void create_face_elements()
-  {
+    {
+      // build up array of singularities
+      Vector<ScalableSingularityForNavierStokesElement<ELEMENT>*> sing_el_pt(Nsingular_fct, 0);
+      
+      if (!CommandLineArgs::command_line_flag_has_been_set("--dont_subtract_singularity"))
+      {
+	for(unsigned ising=0; ising<Nsingular_fct; ising++)
+	{
+	  sing_el_pt[ising] = dynamic_cast<ScalableSingularityForNavierStokesElement<ELEMENT>*>(
+	    Singular_fct_element_mesh_pt->element_pt(ising));
+	}
+      }
+    
     // add Lagrange multipliers to enforce Dirichlet boundary conditions
     if (CommandLineArgs::command_line_flag_has_been_set
 	("--enforce_dirichlet_bcs_by_lagrange_multipliers"))
@@ -710,28 +724,15 @@ private:
 	  int face_index = Bulk_mesh_pt->face_index_at_boundary(i_bound, e);
 	  	  
 	  // Build the corresponding bc element
-	  // N.B. we're calling this without the optional ID, since we have a continuous
-	  // Lagrange multiplier field all the way around the outer boundary due to the
-	  // continuous no-slip boundary conditions
+	  // optional ID is for the off-chance where the augmented region
+	  // comes into contact with a Dirichlet boundary
 	  NavierStokesWithSingularityBCFaceElement<ELEMENT>* bc_element_pt =
 	    new NavierStokesWithSingularityBCFaceElement<ELEMENT>
-	    (bulk_elem_pt, face_index);
+	    (bulk_elem_pt, face_index, BC_el_id);
             
-	  // Tell the element about the singular fct
-	  if (!CommandLineArgs::command_line_flag_has_been_set
-	      ("--dont_subtract_singularity"))
-	  {
-	    Vector<ScalableSingularityForNavierStokesElement<ELEMENT>*> sing_el_pt(Nsingular_fct);
-
-	    for(unsigned ising=0; ising<Nsingular_fct; ising++)
-	    {
-	      sing_el_pt[ising] = dynamic_cast<ScalableSingularityForNavierStokesElement<ELEMENT>*>(
-		Singular_fct_element_mesh_pt->element_pt(ising));
-	    }
-	    
-	    bc_element_pt->set_navier_stokes_sing_el_pt(sing_el_pt);
-	  }
-	  
+	  // Tell the element about the singular fct	  
+	  bc_element_pt->set_navier_stokes_sing_el_pt(sing_el_pt);
+	  	  
 	  //Add the bc element to the surface mesh
 	  Face_mesh_for_bc_pt->add_element_pt(bc_element_pt);
 	}
@@ -743,9 +744,89 @@ private:
       return;
     }
 
-    // Create the face elements needed to compute the amplitude of
-    // the singular function,
+    // ------------------------------------------------------------------------
+    // Now create the face elements which sit on the boundaries of the augmented
+    // regions and enforce continuity between the elements on the "left", i.e.
+    // the augmented elements, and elements on the "right", i.e. the pure FE
+    // elements, via Lagrange multipliers. These face elements also impose the 
+    // singular traction required to handle the discontinuity in the FE part of
+    // the solution moving across this boundary.
+    // ------------------------------------------------------------------------
+
+    
+   // Map keeps a running count of duplicate nodes already created;
+   // existing_duplicate_node_pt[orig_node_pt]=new_node_pt.
+   std::map<Node*,Node*> existing_duplicate_node_pt;
+
+
+   // Flux jump elements on the augmented region boundaries:
+   // ----------------------------------------------
+   // NOTE: Since these duplicate nodes, these elements must be
+   // ----------------------------------------------------------
+   //       constructed first!
+   //       ------------------
+    {
+      Vector<unsigned> flux_jump_boundary_id(4);
+      Vector<unsigned> flux_jump_region_id(4);
+
+      flux_jump_boundary_id[0] = 5;
+      flux_jump_boundary_id[1] = 6;
+      flux_jump_boundary_id[2] = 7;
+      flux_jump_boundary_id[3] = 8;
+
+      flux_jump_region_id[0] = 2;
+      flux_jump_region_id[1] = 3;
+      flux_jump_region_id[2] = 4;
+      flux_jump_region_id[3] = 5;
+
+      // QUEHACERES this is wrong, need to also vectorize Face_mesh_for_flux_jump_pt
+      // since we're gonna have two regions with their own distinct L.M fields.
+      
+      for(unsigned i=0; i<4; i++)
+      {
+	// Where are we?
+	unsigned b         = flux_jump_boundary_id[i];
+	unsigned region_id = flux_jump_region_id[i];
+	
+	unsigned nel = Bulk_mesh_pt->nboundary_element_in_region(b, region_id);
+	
+	for (unsigned e=0; e<nel; e++)
+	{
+	  FiniteElement* el_pt =
+	    Bulk_mesh_pt->boundary_element_in_region_pt(b, region_id, e);
+      
+	  // What is the index of the face of the bulk element at the boundary
+	  int face_index = Bulk_mesh_pt->
+	    face_index_at_boundary_in_region(b, region_id, e);
+      
+	  // Build the corresponding flux jump element
+	  NavierStokesWithSingularityFluxJumpFaceElement<ELEMENT>* flux_jump_element_pt 
+	    = new NavierStokesWithSingularityFluxJumpFaceElement<ELEMENT>
+	    (el_pt, face_index, existing_duplicate_node_pt, Flux_jump_el_id);
+
+	  // Tell the flux jump element about the singular functions
+	  Face_mesh_for_flux_jump_pt->set_navier_stokes_sing_el_pt(sing_el_pt);
+	  
+	  //Add the flux jump element to the mesh
+	  Face_mesh_for_flux_jump_pt->add_element_pt(flux_jump_element_pt);
+	}
+      }
+    }
    
+    // Now add all new (duplicated) nodes to mesh
+    for (std::map<Node*,Node*>::iterator it =
+	   existing_duplicate_node_pt.begin();
+	 it!=existing_duplicate_node_pt.end(); it++)
+    {
+      Face_mesh_for_flux_jump_pt->add_node_pt((*it).second);
+    }
+
+    
+    // ------------------------------------------------------------------------
+    // Create the face elements needed to compute the amplitude of
+    // the singular function
+    // ------------------------------------------------------------------------
+    
     // All outer boundaries
     for(unsigned i_bound=Global_Physical_Variables::First_outer_boundary;
 	  i_bound < Global_Physical_Variables::Last_outer_boundary; i_bound++)
@@ -826,6 +907,9 @@ private:
 
   /// Face element mesh for BC (Lagrange multiplier!) 
   Mesh* Face_mesh_for_bc_pt;
+
+  /// Face element mesh for jump across augmented regions
+  Mesh* Face_mesh_for_flux_jump_pt;
   
   /// \short Meshes of face elements used to compute the amplitudes of the singular
   /// functions (one mesh per singular function)
@@ -839,8 +923,12 @@ private:
 
   // pointer to the plate Geometric Object
   Plate* Plate_pt;
+
+  /// \short Enumeration for IDs of FaceElements (used to figure out
+  /// who's added what additional nodal data...)
+  enum{Flux_jump_el_id, BC_el_id};
   
-}; // end_of_problem_class
+}; // end of Problem class
 
 
 //==start_of_constructor==================================================
@@ -880,11 +968,17 @@ FibreInTwoDBoxProblem<ELEMENT> :: FibreInTwoDBoxProblem() : Newton_step_counter(
     // intrinsic coordinates of the start and end of the plate
     double s_plate_start = atan2(-y_c, -Global_Physical_Variables::plate_radius);
     double s_plate_end   = atan2(-y_c, +Global_Physical_Variables::plate_radius);
-  
+
+    Global_Physical_Variables::high_res_region_zeta =
+      Global_Physical_Variables::high_res_region_zeta_fraction *
+      (s_plate_end - s_plate_start);
+      
     // Make GeomObject representing a circular plate
-      Plate* plate_pt =
+    Plate_pt =
       new CircularPlate(x_c, y_c, r_c, s_plate_start, s_plate_end,
 			Global_Physical_Variables::high_res_region_zeta);
+
+    Plate_pt->set_nsegment(100);
   }
   else 
   {
@@ -896,18 +990,20 @@ FibreInTwoDBoxProblem<ELEMENT> :: FibreInTwoDBoxProblem() : Newton_step_counter(
     start_coords[0] = - Global_Physical_Variables::plate_radius;
     end_coords[0]   = + Global_Physical_Variables::plate_radius;
 
-  
+    Global_Physical_Variables::high_res_region_zeta =
+      Global_Physical_Variables::high_res_region_zeta_fraction *
+      (end_coords[0] - start_coords[0]);
+    
     Plate_pt = new FlatPlate(start_coords, end_coords,
 			     Global_Physical_Variables::high_res_region_zeta);
   }
 
-  
   // Build the mesh
   Bulk_mesh_pt = Global_Physical_Variables::build_the_mesh<ELEMENT>
     (Global_Physical_Variables::element_area, Plate_pt);
 
-  // Let's have a look at the boundary enumeration
-  Bulk_mesh_pt->output_boundaries("boundaries.dat");
+  // // Let's have a look at the boundary enumeration
+  // Bulk_mesh_pt->output_boundaries("boundaries.dat");
 
   // Set error estimator for bulk mesh
   Z2ErrorEstimator* error_estimator_pt = new Z2ErrorEstimator;
@@ -937,7 +1033,6 @@ FibreInTwoDBoxProblem<ELEMENT> :: FibreInTwoDBoxProblem() : Newton_step_counter(
   // check we're not doing pure FE
   if (!CommandLineArgs::command_line_flag_has_been_set("--dont_subtract_singularity"))
   {
-
     // ================================================================
     // QUEHACERES need to add additional sinuglarities here...
     // for the time being we'll do just one edge for the case 
@@ -974,6 +1069,10 @@ FibreInTwoDBoxProblem<ELEMENT> :: FibreInTwoDBoxProblem() : Newton_step_counter(
     {
       Face_mesh_for_singularity_integral_pt.push_back(new Mesh);
     }
+
+    // Create face elements for flux jump
+    //-----------------------------------
+    Face_mesh_for_flux_jump_pt = new Mesh;
   }
 
   // Create face elements for imposition of BC
@@ -984,6 +1083,11 @@ FibreInTwoDBoxProblem<ELEMENT> :: FibreInTwoDBoxProblem() : Newton_step_counter(
 
   // Add 'em to mesh
   add_sub_mesh(Face_mesh_for_bc_pt);
+
+  if (!CommandLineArgs::command_line_flag_has_been_set("--dont_subtract_singularity"))
+  {
+    add_sub_mesh(Face_mesh_for_flux_jump_pt);
+  }
   
   // Build global mesh
   build_global_mesh();
@@ -1904,45 +2008,48 @@ void FibreInTwoDBoxProblem<ELEMENT>::doc_solution()
   }
 
   // =======================================================
+  // plot the radial solution around the plate edge at various angles
 
-  Vector<double> origin(2, 0.0);
-
-  origin[0] = -Global_Physical_Variables::plate_radius;
-  
-  // loop over the number of angles we're gonna plot
-  unsigned ntheta = 7;
-  unsigned npoints = 1001;
-
-  double radius = 0.75*(
-    Global_Physical_Variables::plate_radius - Global_Physical_Variables::L_edge_x);
-  
-  for(unsigned i=0; i<ntheta; i++)
+  if(Doc_info.number() != 0)
   {
-    // angle of this plot point
-    double theta = (i+1) * 2.0 * MathematicalConstants::Pi/(ntheta+1);
+    Vector<double> origin(2, 0.0);
 
-    // output cartesian coordinates
-    Vector<Vector<double> > coords_xy;
-
-    // get xy coordinates
-    Global_Physical_Variables::get_line_coordinates(radius, theta, coords_xy, origin, npoints);
-
-    // create the visualiser for this angle
-    LineVisualiser line_visualiser(Bulk_mesh_pt, coords_xy);
-
-    // open file
-    sprintf( filename, "%s/soln_theta=%f_%i.dat", Doc_info.directory().c_str(),
-	     theta, Doc_info.number());
-
-    some_file.open(filename);
-
-    // print out the points
-    line_visualiser.output(some_file);
-
-    // done with this file
-    some_file.close();
-  }
+    origin[0] = -Global_Physical_Variables::plate_radius;
   
+    // loop over the number of angles we're gonna plot
+    unsigned ntheta = 7;
+    unsigned npoints = 201;
+
+    double radius = 0.5*(
+      Global_Physical_Variables::R_edge_x - Global_Physical_Variables::plate_radius);
+  
+    for(unsigned i=0; i<ntheta; i++)
+    {
+      // angle of this plot point
+      double theta = (i+1) * 2.0 * MathematicalConstants::Pi/(ntheta+1);
+
+      // output cartesian coordinates
+      Vector<Vector<double> > coords_xy;
+
+      // get xy coordinates
+      Global_Physical_Variables::get_line_coordinates(radius, theta, coords_xy, origin, npoints);
+
+      // create the visualiser for this angle
+      LineVisualiser line_visualiser(Bulk_mesh_pt, coords_xy);
+
+      // open file
+      sprintf( filename, "%s/soln_theta=%f_%i.dat", Doc_info.directory().c_str(),
+	       theta, Doc_info.number());
+
+      some_file.open(filename);
+
+      // print out the points
+      line_visualiser.output(some_file);
+
+      // done with this file
+      some_file.close();
+    }
+  }
   // increment the solution numbering
   Doc_info.number()++;
   
@@ -2025,7 +2132,7 @@ void FibreInTwoDBoxProblem<ELEMENT>::set_values_to_singular_solution()
 
 
 //==start_of_main======================================================
-/// Driver for backward step with impedance outflow bc
+/// Driver for an arbitrarily curved 1D fibre moving in a 2D box
 //=====================================================================
 int main(int argc, char **argv)
 {
@@ -2045,9 +2152,10 @@ int main(int argc, char **argv)
   CommandLineArgs::specify_command_line_flag(
     "--high_res_element_area", &Global_Physical_Variables::hi_res_element_area);
   
-  // // specify the radius of the high resolution circular region around each edge of the plate
-  // CommandLineArgs::specify_command_line_flag(
-  //   "--high_res_region_radius", &Global_Physical_Variables::high_res_region_radius);
+  // specify the radius of the high resolution circular region around each edge of the plate
+  // as a fraction of the total zeta from the start to the end of the plate
+  CommandLineArgs::specify_command_line_flag(
+     "--high_res_region_fraction", &Global_Physical_Variables::high_res_region_zeta_fraction);
   
   // specify the x-component of the plate velocity
   CommandLineArgs::specify_command_line_flag("--velocity_x",
